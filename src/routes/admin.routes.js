@@ -1,11 +1,11 @@
 // ══════════════════════════════════════════════════════════════
 // src/routes/admin.routes.js
 // ══════════════════════════════════════════════════════════════
-const express = require('express');
-const bcrypt  = require('bcryptjs');
-const jwt     = require('jsonwebtoken');
-const { query } = require('../config/db');
-const push    = require('../services/pushNotifications');
+const express      = require('express');
+const bcrypt       = require('bcryptjs');
+const jwt          = require('jsonwebtoken');
+const { query, transaction } = require('../config/db');
+const push         = require('../services/pushNotifications');
 
 const router = express.Router();
 const ADMIN_SECRET = process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET + '_admin';
@@ -82,7 +82,7 @@ router.get('/auth/me', adminAuth(), (req, res) => {
 
 router.get('/dashboard', adminAuth(['admin', 'moderator']), async (req, res) => {
   try {
-    const [users, orders, recharges, wallets] = await Promise.all([
+    const [users, orders, recharges, wallets, withdrawals] = await Promise.all([
       query(`
         SELECT
           COUNT(*) FILTER (WHERE role = 'client')   AS clients,
@@ -111,20 +111,25 @@ router.get('/dashboard', adminAuth(['admin', 'moderator']), async (req, res) => 
         FROM recharge_requests
       `),
       query(`
+        SELECT SUM(balance) AS total_balance, SUM(blocked_balance) AS total_blocked FROM wallets
+      `),
+      query(`
         SELECT
-          SUM(balance)         AS total_balance,
-          SUM(blocked_balance) AS total_blocked
-        FROM wallets
+          COUNT(*) FILTER (WHERE status = 'pending')    AS pending,
+          COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+          SUM(amount) FILTER (WHERE status = 'pending') AS pending_amount
+        FROM withdrawal_requests
       `),
     ]);
 
     res.json({
       success: true,
       data: {
-        users:     users.rows[0],
-        orders:    orders.rows[0],
-        recharges: recharges.rows[0],
-        wallet:    wallets.rows[0],
+        users:       users.rows[0],
+        orders:      orders.rows[0],
+        recharges:   recharges.rows[0],
+        wallet:      wallets.rows[0],
+        withdrawals: withdrawals.rows[0],
       },
     });
   } catch (err) {
@@ -191,7 +196,7 @@ router.patch('/users/:id', adminAuth(['admin', 'moderator']), async (req, res) =
 
 // ════════════════════════════════════════════════════════════════
 // KYC — tabla: provider_kyc
-// reviewed_by ahora apunta a admin_users (después del fix SQL)
+// reviewed_by apunta a admin_users (después del fix SQL)
 // ════════════════════════════════════════════════════════════════
 
 router.get('/kyc', adminAuth(['admin', 'moderator']), async (req, res) => {
@@ -231,8 +236,7 @@ router.post('/kyc/:id/approve', adminAuth(['admin', 'moderator']), async (req, r
     const { rows: [kyc] } = await query(
       `UPDATE provider_kyc
        SET status = 'approved', reviewed_at = NOW(), reviewed_by = $1
-       WHERE id = $2
-       RETURNING user_id`,
+       WHERE id = $2 RETURNING user_id`,
       [req.admin.id, req.params.id]
     );
     if (!kyc) return res.status(404).json({ success: false, message: 'KYC no encontrado' });
@@ -260,8 +264,7 @@ router.post('/kyc/:id/reject', adminAuth(['admin', 'moderator']), async (req, re
       `UPDATE provider_kyc
        SET status = 'rejected', reviewed_at = NOW(),
            reviewed_by = $1, rejection_reason = $2
-       WHERE id = $3
-       RETURNING user_id`,
+       WHERE id = $3 RETURNING user_id`,
       [req.admin.id, reason, req.params.id]
     );
     if (!kyc) return res.status(404).json({ success: false, message: 'KYC no encontrado' });
@@ -333,7 +336,7 @@ router.get('/orders', adminAuth(['admin', 'moderator']), async (req, res) => {
 
 // ════════════════════════════════════════════════════════════════
 // RECARGAS — tabla: recharge_requests
-// reviewed_by ahora apunta a admin_users (después del fix SQL)
+// reviewed_by apunta a admin_users (después del fix SQL)
 // ════════════════════════════════════════════════════════════════
 
 router.get('/recharges', adminAuth(['admin', 'moderator', 'conciliator']), async (req, res) => {
@@ -349,7 +352,7 @@ router.get('/recharges', adminAuth(['admin', 'moderator', 'conciliator']), async
         r.reviewed_at, r.admin_notes AS rejection_reason,
         u.full_name, u.email, u.phone,
         pm.name AS payment_method_name,
-        pm.type AS payment_method_type,
+        pm.type::text AS payment_method_type,
         a.full_name AS reviewed_by_name
       FROM recharge_requests r
       JOIN users u ON u.id = r.user_id
@@ -370,6 +373,7 @@ router.get('/recharges', adminAuth(['admin', 'moderator', 'conciliator']), async
   }
 });
 
+// POST /admin/recharges/:id/approve — usa WalletService para registrar transacción
 router.post('/recharges/:id/approve', adminAuth(['admin', 'moderator', 'conciliator']), async (req, res) => {
   try {
     const { rows: [recharge] } = await query(
@@ -378,20 +382,52 @@ router.post('/recharges/:id/approve', adminAuth(['admin', 'moderator', 'concilia
     );
     if (!recharge) return res.status(404).json({ success: false, message: 'Recarga no encontrada o ya procesada' });
 
-    await query(
-      'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
-      [recharge.amount, recharge.user_id]
-    );
+    // Usar transaction para acreditar saldo + registrar en wallet_transactions
+    await transaction(async (client) => {
+      // Obtener wallet del usuario con lock
+      const { rows: [wallet] } = await client.query(
+        'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [recharge.user_id]
+      );
 
-    await query(
-      `UPDATE recharge_requests
-       SET status = 'approved', reviewed_at = NOW(), reviewed_by = $1
-       WHERE id = $2`,
-      [req.admin.id, recharge.id]
-    );
+      const balanceBefore = parseFloat(wallet.balance);
+      const amount        = parseFloat(recharge.amount);
+      const balanceAfter  = balanceBefore + amount;
+
+      // Acreditar saldo
+      await client.query(
+        'UPDATE wallets SET balance = $1 WHERE user_id = $2',
+        [balanceAfter, recharge.user_id]
+      );
+
+      // Registrar en wallet_transactions (igual que WalletService.credit)
+      await client.query(`
+        INSERT INTO wallet_transactions
+          (wallet_id, type, status, amount, balance_before, balance_after,
+           reference_id, reference_type, description, metadata)
+        VALUES ($1, 'recharge', 'approved', $2, $3, $4, $5, 'recharge_request', $6, $7)
+      `, [
+        wallet.id,
+        amount,
+        balanceBefore,
+        balanceAfter,
+        recharge.id,
+        `Recarga aprobada por: ${req.admin.full_name}`,
+        JSON.stringify({ admin_id: req.admin.id, admin_name: req.admin.full_name }),
+      ]);
+
+      // Marcar recarga como aprobada con el admin que la procesó
+      await client.query(
+        `UPDATE recharge_requests
+         SET status = 'approved', reviewed_at = NOW(), reviewed_by = $1,
+             admin_notes = $2
+         WHERE id = $3`,
+        [req.admin.id, `Aprobado por: ${req.admin.full_name}`, recharge.id]
+      );
+    });
 
     push.notifyRechargeApproved(recharge.user_id, recharge.amount).catch(() => {});
-    res.json({ success: true, message: 'Recarga aprobada' });
+    res.json({ success: true, message: 'Recarga aprobada y saldo acreditado' });
   } catch (err) {
     console.error('recharge approve error:', err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -421,6 +457,206 @@ router.post('/recharges/:id/reject', adminAuth(['admin', 'moderator', 'conciliat
     res.json({ success: true, message: 'Recarga rechazada' });
   } catch (err) {
     console.error('recharge reject error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// RETIROS — tabla: withdrawal_requests
+// ════════════════════════════════════════════════════════════════
+
+router.get('/withdrawals', adminAuth(['admin', 'moderator', 'conciliator']), async (req, res) => {
+  try {
+    const { status = 'pending', page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+
+    const { rows } = await query(`
+      SELECT
+        w.id, w.user_id, w.amount, w.status::text AS status,
+        w.payout_details, w.created_at, w.processed_at,
+        w.admin_notes,
+        u.full_name, u.email, u.phone,
+        pm.name AS payment_method_name,
+        pm.type::text AS payment_method_type,
+        wa.balance AS current_balance,
+        a.full_name AS processed_by_name
+      FROM withdrawal_requests w
+      JOIN users u ON u.id = w.user_id
+      LEFT JOIN payment_methods pm ON pm.id = w.payment_method_id
+      LEFT JOIN wallets wa ON wa.user_id = w.user_id
+      LEFT JOIN admin_users a ON a.id = w.processed_by
+      WHERE w.status::text = $1
+      ORDER BY w.created_at ASC
+      LIMIT $2 OFFSET $3
+    `, [status, limit, offset]);
+
+    const { rows: [{ count }] } = await query(
+      'SELECT COUNT(*) FROM withdrawal_requests WHERE status::text = $1', [status]
+    );
+
+    res.json({ success: true, data: rows, total: parseInt(count) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/withdrawals/:id/approve', adminAuth(['admin', 'moderator', 'conciliator']), async (req, res) => {
+  try {
+    const { rows: [wr] } = await query(
+      "SELECT * FROM withdrawal_requests WHERE id = $1 AND status = 'pending'",
+      [req.params.id]
+    );
+    if (!wr) return res.status(404).json({ success: false, message: 'Retiro no encontrado o ya procesado' });
+
+    await transaction(async (client) => {
+      const { rows: [wallet] } = await client.query(
+        'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [wr.user_id]
+      );
+
+      const balanceBefore = parseFloat(wallet.balance);
+      const amount        = parseFloat(wr.amount);
+
+      if (balanceBefore < amount)
+        throw new Error(`Saldo insuficiente. Disponible: $${balanceBefore.toFixed(2)}`);
+
+      const balanceAfter = balanceBefore - amount;
+
+      // Descontar saldo
+      await client.query(
+        'UPDATE wallets SET balance = $1, total_withdrawn = total_withdrawn + $2 WHERE user_id = $3',
+        [balanceAfter, amount, wr.user_id]
+      );
+
+      // Registrar transacción
+      await client.query(`
+        INSERT INTO wallet_transactions
+          (wallet_id, type, status, amount, balance_before, balance_after,
+           reference_id, reference_type, description, metadata)
+        VALUES ($1, 'withdrawal', 'approved', $2, $3, $4, $5, 'withdrawal_request', $6, $7)
+      `, [
+        wallet.id, amount, balanceBefore, balanceAfter, wr.id,
+        `Retiro procesado por: ${req.admin.full_name}`,
+        JSON.stringify({ admin_id: req.admin.id, admin_name: req.admin.full_name }),
+      ]);
+
+      // Marcar como completado
+      await client.query(
+        `UPDATE withdrawal_requests
+         SET status = 'completed', processed_at = NOW(), processed_by = $1,
+             admin_notes = $2
+         WHERE id = $3`,
+        [req.admin.id, `Procesado por: ${req.admin.full_name}`, wr.id]
+      );
+    });
+
+    // Notificar al proveedor
+    push.sendPushToUser(wr.user_id, {
+      title: '💵 Retiro procesado',
+      body:  `Tu retiro de $${parseFloat(wr.amount).toFixed(2)} fue procesado exitosamente.`,
+      data:  { screen: 'wallet' },
+    }).catch(() => {});
+
+    res.json({ success: true, message: 'Retiro aprobado y saldo descontado' });
+  } catch (err) {
+    console.error('withdrawal approve error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/withdrawals/:id/reject', adminAuth(['admin', 'moderator', 'conciliator']), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason) return res.status(400).json({ success: false, message: 'Motivo requerido' });
+
+    const { rows: [wr] } = await query(
+      "SELECT * FROM withdrawal_requests WHERE id = $1 AND status = 'pending'",
+      [req.params.id]
+    );
+    if (!wr) return res.status(404).json({ success: false, message: 'Retiro no encontrado o ya procesado' });
+
+    await query(
+      `UPDATE withdrawal_requests
+       SET status = 'rejected', processed_at = NOW(),
+           processed_by = $1, admin_notes = $2
+       WHERE id = $3`,
+      [req.admin.id, reason, wr.id]
+    );
+
+    push.sendPushToUser(wr.user_id, {
+      title: '❌ Retiro rechazado',
+      body:  reason,
+      data:  { screen: 'wallet' },
+    }).catch(() => {});
+
+    res.json({ success: true, message: 'Retiro rechazado' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// MÉTODOS DE PAGO — tabla: payment_methods
+// ════════════════════════════════════════════════════════════════
+
+router.get('/payment-methods', adminAuth(['admin', 'moderator']), async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT * FROM payment_methods ORDER BY sort_order, created_at'
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/payment-methods', adminAuth(['admin']), async (req, res) => {
+  try {
+    const { name, type, currency = 'USD', instructions, fields = [], minAmount = 1, maxAmount = 1000, verificationTime = '1-4 horas', sortOrder = 0 } = req.body;
+    if (!name || !type)
+      return res.status(400).json({ success: false, message: 'name y type son requeridos' });
+
+    const { rows: [pm] } = await query(`
+      INSERT INTO payment_methods
+        (name, type, currency, instructions, fields, min_amount, max_amount, verification_time, sort_order)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+    `, [name, type, currency, instructions || null, JSON.stringify(fields), minAmount, maxAmount, verificationTime, sortOrder]);
+
+    res.status(201).json({ success: true, data: pm });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.patch('/payment-methods/:id', adminAuth(['admin']), async (req, res) => {
+  try {
+    const { name, instructions, minAmount, maxAmount, verificationTime, isActive, sortOrder } = req.body;
+    await query(`
+      UPDATE payment_methods SET
+        name              = COALESCE($1, name),
+        instructions      = COALESCE($2, instructions),
+        min_amount        = COALESCE($3, min_amount),
+        max_amount        = COALESCE($4, max_amount),
+        verification_time = COALESCE($5, verification_time),
+        is_active         = COALESCE($6, is_active),
+        sort_order        = COALESCE($7, sort_order),
+        updated_at        = NOW()
+      WHERE id = $8
+    `, [name ?? null, instructions ?? null, minAmount ?? null, maxAmount ?? null,
+        verificationTime ?? null, isActive ?? null, sortOrder ?? null, req.params.id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/payment-methods/:id', adminAuth(['admin']), async (req, res) => {
+  try {
+    await query('UPDATE payment_methods SET is_active = false WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'Método desactivado' });
+  } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
