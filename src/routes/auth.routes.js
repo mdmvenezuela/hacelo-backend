@@ -75,7 +75,7 @@ router.post('/register', async (req, res) => {
     if (role === 'provider') {
       await query(`
         INSERT INTO provider_profiles (user_id, is_verified, kyc_status)
-        VALUES ($1, false, 'not_submitted')
+        VALUES ($1, false, 'pending')
         ON CONFLICT (user_id) DO NOTHING
       `, [user.id]);
       await query(`
