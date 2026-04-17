@@ -94,9 +94,9 @@ walletRouter.get('/withdrawals', authenticate, async (req, res) => {
 });
 
 // POST /wallet/withdraw — Proveedor solicita retiro
-// Al solicitar : balance baja SOLAMENTE — sin transacción todavía
-// Al aprobar   : admin registra transacción de débito (withdrawal approved)
-// Al rechazar  : admin devuelve saldo y registra transacción de reembolso (refund)
+// Al solicitar: balance baja, blocked_balance sube (escrow)
+// Al aprobar (admin): blocked_balance baja, total_withdrawn sube
+// Al rechazar (admin): blocked_balance baja, balance sube (devolver)
 walletRouter.post('/withdraw', authenticate, async (req, res) => {
   try {
     const { amount, paymentMethodId, payoutDetails } = req.body;
@@ -105,57 +105,72 @@ walletRouter.post('/withdraw', authenticate, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Monto inválido' });
     }
 
-    // Máximo 1 retiro pendiente simultáneo
-    const { rows: pendingWr } = await query(
+    // Verificar que no tenga retiros pendientes (máx 1 simultáneo)
+    const { rows: pending } = await query(
       `SELECT id FROM withdrawal_requests WHERE user_id = $1 AND status IN ('pending','processing')`,
       [req.user.id]
     );
-    if (pendingWr.length >= 1) {
+    if (pending.length >= 1) {
       return res.status(400).json({ success: false, message: 'Ya tienes un retiro pendiente. Espera que sea procesado.' });
     }
 
-    let newBalance;
-
     await transaction(async (client) => {
+      // Lock wallet
       const { rows: [wallet] } = await client.query(
         'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
         [req.user.id]
       );
 
-      const balanceBefore = parseFloat(wallet.balance);
-      const amt           = parseFloat(amount);
+      const balanceBefore  = parseFloat(wallet.balance);
+      const amt            = parseFloat(amount);
 
       if (balanceBefore < amt) {
         throw new Error(`Saldo insuficiente. Disponible: $${balanceBefore.toFixed(2)}`);
       }
 
-      newBalance = parseFloat((balanceBefore - amt).toFixed(2));
+      const balanceAfter  = balanceBefore - amt;
+      const blockedAfter  = parseFloat(wallet.blocked_balance) + amt;
 
-      // Solo descontar del balance — SIN registrar transacción todavía
+      // Mover de balance a blocked_balance (escrow mientras se procesa)
       await client.query(
-        'UPDATE wallets SET balance = $1 WHERE user_id = $2',
-        [newBalance, req.user.id]
+        'UPDATE wallets SET balance = $1, blocked_balance = $2 WHERE user_id = $3',
+        [balanceAfter, blockedAfter, req.user.id]
       );
 
-      // Crear solicitud de retiro
+      // Registrar transacción pendiente
       await client.query(`
+        INSERT INTO wallet_transactions
+          (wallet_id, type, status, amount, balance_before, balance_after,
+           reference_type, description, metadata)
+        VALUES ($1, 'withdrawal', 'pending', $2, $3, $4, 'withdrawal_request',
+                $5, $6)
+      `, [
+        wallet.id, amt, balanceBefore, balanceAfter,
+        `Retiro solicitado — en proceso de verificación`,
+        JSON.stringify({ payout_details: payoutDetails }),
+      ]);
+
+      // Crear solicitud de retiro
+      const { rows: [wr] } = await client.query(`
         INSERT INTO withdrawal_requests
           (user_id, wallet_id, amount, payment_method_id, payout_details)
-        VALUES ($1, $2, $3, $4, $5)
-      `, [
-        req.user.id,
-        wallet.id,
-        amt,
-        paymentMethodId || null,
-        JSON.stringify(payoutDetails || {}),
-      ]);
+        VALUES ($1, $2, $3, $4, $5) RETURNING *
+      `, [req.user.id, wallet.id, amt, paymentMethodId || null, JSON.stringify(payoutDetails || {})]);
+
+      // Actualizar reference_id en la transacción que acabamos de insertar
+      await client.query(`
+        UPDATE wallet_transactions SET reference_id = $1
+        WHERE wallet_id = $2 AND type = 'withdrawal' AND status = 'pending'
+          AND reference_id IS NULL
+        ORDER BY created_at DESC LIMIT 1
+      `, [wr.id, wallet.id]);
+
+      return wr;
     });
 
-    // Devolver el nuevo saldo para que la app lo actualice en tiempo real
     res.status(201).json({
       success: true,
-      message: 'Solicitud de retiro enviada.',
-      data: { balance: newBalance },
+      message: 'Solicitud de retiro enviada. Tu saldo está reservado mientras se procesa.',
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

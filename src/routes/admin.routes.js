@@ -514,32 +514,27 @@ router.post('/withdrawals/:id/approve', adminAuth(['admin', 'moderator', 'concil
         [wr.user_id]
       );
 
-      const amount      = parseFloat(wr.amount);
-      const blockedNow  = parseFloat(wallet.blocked_balance);
-
-      if (blockedNow < amount)
-        throw new Error(`Saldo en escrow insuficiente. Bloqueado: $${blockedNow.toFixed(2)}`);
-
-      // El balance ya fue descontado al solicitar —
-      // solo quitar del blocked_balance y sumar a total_withdrawn
-      const blockedAfter = blockedNow - amount;
-
+      const amount       = parseFloat(wr.amount);
+      const balanceNow   = parseFloat(wallet.balance);
+      // El balance ya fue descontado cuando el proveedor solicitó el retiro.
+      // Aquí solo sumamos a total_withdrawn para registrar el egreso definitivo.
       await client.query(
-        'UPDATE wallets SET blocked_balance = $1, total_withdrawn = total_withdrawn + $2 WHERE user_id = $3',
-        [blockedAfter, amount, wr.user_id]
+        'UPDATE wallets SET total_withdrawn = total_withdrawn + $1 WHERE user_id = $2',
+        [amount, wr.user_id]
       );
 
-      // Registrar transacción aprobada
+      // Registrar transacción de débito (withdrawal aprobado)
       await client.query(`
         INSERT INTO wallet_transactions
           (wallet_id, type, status, amount, balance_before, balance_after,
            reference_id, reference_type, description, metadata)
         VALUES ($1, 'withdrawal', 'approved', $2, $3, $3, $4, 'withdrawal_request', $5, $6)
       `, [
-        wallet.id, amount,
-        parseFloat(wallet.balance), // balance no cambia, ya bajó al solicitar
+        wallet.id,
+        amount,
+        balanceNow, // balance no cambia aquí, ya bajó al solicitar
         wr.id,
-        `Retiro aprobado por: ${req.admin.full_name}`,
+        `Retiro de $${amount.toFixed(2)} aprobado por: ${req.admin.full_name}`,
         JSON.stringify({ admin_id: req.admin.id, admin_name: req.admin.full_name }),
       ]);
 
@@ -584,24 +579,27 @@ router.post('/withdrawals/:id/reject', adminAuth(['admin', 'moderator', 'concili
 
       const amount        = parseFloat(wr.amount);
       const balanceBefore = parseFloat(wallet.balance);
-      const balanceAfter  = balanceBefore + amount; // devolver al balance
-      const blockedAfter  = Math.max(0, parseFloat(wallet.blocked_balance) - amount);
+      const balanceAfter  = parseFloat((balanceBefore + amount).toFixed(2));
 
-      // Devolver fondos del escrow al balance
+      // Devolver el saldo que fue descontado al solicitar
       await client.query(
-        'UPDATE wallets SET balance = $1, blocked_balance = $2 WHERE user_id = $3',
-        [balanceAfter, blockedAfter, wr.user_id]
+        'UPDATE wallets SET balance = $1 WHERE user_id = $2',
+        [balanceAfter, wr.user_id]
       );
 
-      // Registrar devolución
+      // Registrar transacción de reembolso (refund)
       await client.query(`
         INSERT INTO wallet_transactions
           (wallet_id, type, status, amount, balance_before, balance_after,
            reference_id, reference_type, description, metadata)
-        VALUES ($1, 'withdrawal', 'rejected', $2, $3, $4, $5, 'withdrawal_request', $6, $7)
+        VALUES ($1, 'refund', 'approved', $2, $3, $4, $5, 'withdrawal_request', $6, $7)
       `, [
-        wallet.id, amount, balanceBefore, balanceAfter, wr.id,
-        `Retiro rechazado — saldo devuelto. Motivo: ${reason}`,
+        wallet.id,
+        amount,
+        balanceBefore,
+        balanceAfter,
+        wr.id,
+        `Reembolso de retiro rechazado. Motivo: ${reason}`,
         JSON.stringify({ admin_id: req.admin.id, admin_name: req.admin.full_name, reason }),
       ]);
 
@@ -615,8 +613,8 @@ router.post('/withdrawals/:id/reject', adminAuth(['admin', 'moderator', 'concili
     });
 
     push.sendPushToUser(wr.user_id, {
-      title: '❌ Retiro rechazado',
-      body:  `Tu retiro fue rechazado y el saldo fue devuelto. Motivo: ${reason}`,
+      title: '↩️ Retiro rechazado — saldo devuelto',
+      body:  `Tu retiro de $${parseFloat(wr.amount).toFixed(2)} fue rechazado y tu saldo fue restaurado. Motivo: ${reason}`,
       data:  { screen: 'wallet' },
     }).catch(() => {});
 
