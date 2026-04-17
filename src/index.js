@@ -28,37 +28,35 @@ const server = http.createServer(app);
 
 initSocket(server);
 
-app.use(helmet());
-app.use(compression());
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-
-// ── CORS ──────────────────────────────────────────────────────
+// ── CORS va PRIMERO — antes de helmet y todo lo demás ─────────
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(o => o.trim())
-  .filter(Boolean); // elimina entradas vacías
+  .filter(Boolean);
 
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
-    // Sin origin: apps móviles, Postman, curl → permitir siempre
     if (!origin) return callback(null, true);
-    // Lista vacía (sin .env) → permitir todo (solo desarrollo)
     if (allowedOrigins.length === 0) return callback(null, true);
-    // Origin en lista → permitir
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    // Bloqueado
     console.warn(`🚫 CORS bloqueado: ${origin}`);
     callback(new Error(`CORS bloqueado: ${origin}`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+  optionsSuccessStatus: 204,
+};
 
-// Responder preflight OPTIONS antes de cualquier ruta
-app.options('*', cors());
+// Preflight para TODAS las rutas — debe ser lo primero
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
 
-// ─────────────────────────────────────────────────────────────
+// ── El resto de middlewares van después del CORS ──────────────
+app.use(helmet());
+app.use(compression());
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
