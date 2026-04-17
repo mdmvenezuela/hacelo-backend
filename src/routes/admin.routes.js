@@ -1,6 +1,5 @@
 // ══════════════════════════════════════════════════════════════
 // src/routes/admin.routes.js
-// Nombres de tablas exactos según el schema real de la DB
 // ══════════════════════════════════════════════════════════════
 const express = require('express');
 const bcrypt  = require('bcryptjs');
@@ -78,34 +77,31 @@ router.get('/auth/me', adminAuth(), (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// DASHBOARD — admin y moderador
+// DASHBOARD
 // ════════════════════════════════════════════════════════════════
 
 router.get('/dashboard', adminAuth(['admin', 'moderator']), async (req, res) => {
   try {
     const [users, orders, recharges, wallets] = await Promise.all([
-      // Tabla: users
       query(`
         SELECT
           COUNT(*) FILTER (WHERE role = 'client')   AS clients,
           COUNT(*) FILTER (WHERE role = 'provider') AS providers,
           COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS new_this_week
-        FROM users
-        WHERE role != 'admin'
+        FROM users WHERE role != 'admin'
       `),
-      // Tabla: orders
       query(`
         SELECT
-          COUNT(*)                                              AS total,
-          COUNT(*) FILTER (WHERE status = 'requested')         AS pending,
-          COUNT(*) FILTER (WHERE status = 'in_progress')       AS in_progress,
-          COUNT(*) FILTER (WHERE status = 'completed')         AS completed,
-          COUNT(*) FILTER (WHERE status = 'confirmed')         AS confirmed,
-          COUNT(*) FILTER (WHERE status = 'cancelled')         AS cancelled,
-          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS this_week
+          COUNT(*)                                                          AS total,
+          COUNT(*) FILTER (WHERE status = 'requested')                     AS pending,
+          COUNT(*) FILTER (WHERE status::text IN ('accepted','in_conversation',
+            'on_the_way','diagnosing','quote_sent','in_progress'))          AS in_progress,
+          COUNT(*) FILTER (WHERE status = 'completed')                     AS completed,
+          COUNT(*) FILTER (WHERE status = 'confirmed')                     AS confirmed,
+          COUNT(*) FILTER (WHERE status = 'cancelled')                     AS cancelled,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')  AS this_week
         FROM orders
       `),
-      // Tabla: recharge_requests (nombre real en la DB)
       query(`
         SELECT
           COUNT(*) FILTER (WHERE status = 'pending')  AS pending,
@@ -114,7 +110,6 @@ router.get('/dashboard', adminAuth(['admin', 'moderator']), async (req, res) => 
           SUM(amount) FILTER (WHERE status = 'approved') AS total_approved_amount
         FROM recharge_requests
       `),
-      // Tabla: wallets
       query(`
         SELECT
           SUM(balance)         AS total_balance,
@@ -126,10 +121,10 @@ router.get('/dashboard', adminAuth(['admin', 'moderator']), async (req, res) => 
     res.json({
       success: true,
       data: {
-        users:    users.rows[0],
-        orders:   orders.rows[0],
+        users:     users.rows[0],
+        orders:    orders.rows[0],
         recharges: recharges.rows[0],
-        wallet:   wallets.rows[0],
+        wallet:    wallets.rows[0],
       },
     });
   } catch (err) {
@@ -139,7 +134,7 @@ router.get('/dashboard', adminAuth(['admin', 'moderator']), async (req, res) => 
 });
 
 // ════════════════════════════════════════════════════════════════
-// USUARIOS — admin y moderador
+// USUARIOS
 // ════════════════════════════════════════════════════════════════
 
 router.get('/users', adminAuth(['admin', 'moderator']), async (req, res) => {
@@ -195,8 +190,8 @@ router.patch('/users/:id', adminAuth(['admin', 'moderator']), async (req, res) =
 });
 
 // ════════════════════════════════════════════════════════════════
-// KYC — admin y moderador
-// Tabla real: provider_kyc
+// KYC — tabla: provider_kyc
+// reviewed_by ahora apunta a admin_users (después del fix SQL)
 // ════════════════════════════════════════════════════════════════
 
 router.get('/kyc', adminAuth(['admin', 'moderator']), async (req, res) => {
@@ -211,9 +206,11 @@ router.get('/kyc', adminAuth(['admin', 'moderator']), async (req, res) => {
         k.selfie_url, k.id_front_url, k.id_back_url,
         k.rif_url, k.video_selfie_url,
         k.full_name_doc, k.id_number, k.rif_number,
-        u.full_name, u.email, u.phone
+        u.full_name, u.email, u.phone,
+        a.full_name AS reviewed_by_name
       FROM provider_kyc k
       JOIN users u ON u.id = k.user_id
+      LEFT JOIN admin_users a ON a.id = k.reviewed_by
       WHERE k.status = $1
       ORDER BY k.submitted_at ASC
       LIMIT $2 OFFSET $3
@@ -234,7 +231,8 @@ router.post('/kyc/:id/approve', adminAuth(['admin', 'moderator']), async (req, r
     const { rows: [kyc] } = await query(
       `UPDATE provider_kyc
        SET status = 'approved', reviewed_at = NOW(), reviewed_by = $1
-       WHERE id = $2 RETURNING user_id`,
+       WHERE id = $2
+       RETURNING user_id`,
       [req.admin.id, req.params.id]
     );
     if (!kyc) return res.status(404).json({ success: false, message: 'KYC no encontrado' });
@@ -248,6 +246,7 @@ router.post('/kyc/:id/approve', adminAuth(['admin', 'moderator']), async (req, r
     push.notifyKYCApproved(kyc.user_id).catch(() => {});
     res.json({ success: true, message: 'KYC aprobado' });
   } catch (err) {
+    console.error('kyc approve error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -261,7 +260,8 @@ router.post('/kyc/:id/reject', adminAuth(['admin', 'moderator']), async (req, re
       `UPDATE provider_kyc
        SET status = 'rejected', reviewed_at = NOW(),
            reviewed_by = $1, rejection_reason = $2
-       WHERE id = $3 RETURNING user_id`,
+       WHERE id = $3
+       RETURNING user_id`,
       [req.admin.id, reason, req.params.id]
     );
     if (!kyc) return res.status(404).json({ success: false, message: 'KYC no encontrado' });
@@ -274,12 +274,13 @@ router.post('/kyc/:id/reject', adminAuth(['admin', 'moderator']), async (req, re
     push.notifyKYCRejected(kyc.user_id, reason).catch(() => {});
     res.json({ success: true, message: 'KYC rechazado' });
   } catch (err) {
+    console.error('kyc reject error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
 // ════════════════════════════════════════════════════════════════
-// ÓRDENES — admin y moderador
+// ÓRDENES
 // ════════════════════════════════════════════════════════════════
 
 router.get('/orders', adminAuth(['admin', 'moderator']), async (req, res) => {
@@ -291,7 +292,7 @@ router.get('/orders', adminAuth(['admin', 'moderator']), async (req, res) => {
 
     if (status) {
       params.push(status);
-      conditions.push(`o.status = $${params.length}::order_status`);
+      conditions.push(`o.status::text = $${params.length}`);
     }
     if (search) {
       params.push(`%${search}%`);
@@ -302,7 +303,7 @@ router.get('/orders', adminAuth(['admin', 'moderator']), async (req, res) => {
 
     const { rows } = await query(`
       SELECT
-        o.id, o.order_number, o.title, o.status,
+        o.id, o.order_number, o.title, o.status::text AS status,
         o.visit_price, o.work_total, o.is_urgent,
         o.created_at, o.confirmed_at, o.commission_amount,
         uc.full_name AS client_name, uc.email AS client_email,
@@ -331,8 +332,8 @@ router.get('/orders', adminAuth(['admin', 'moderator']), async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// RECARGAS — todos los roles
-// Tabla real: recharge_requests
+// RECARGAS — tabla: recharge_requests
+// reviewed_by ahora apunta a admin_users (después del fix SQL)
 // ════════════════════════════════════════════════════════════════
 
 router.get('/recharges', adminAuth(['admin', 'moderator', 'conciliator']), async (req, res) => {
@@ -342,23 +343,25 @@ router.get('/recharges', adminAuth(['admin', 'moderator', 'conciliator']), async
 
     const { rows } = await query(`
       SELECT
-        r.id, r.user_id, r.amount, r.status,
+        r.id, r.user_id, r.amount, r.status::text AS status,
         r.reference_number, r.payment_date,
         r.origin_bank, r.notes, r.created_at,
         r.reviewed_at, r.admin_notes AS rejection_reason,
         u.full_name, u.email, u.phone,
         pm.name AS payment_method_name,
-        pm.type AS payment_method_type
+        pm.type AS payment_method_type,
+        a.full_name AS reviewed_by_name
       FROM recharge_requests r
       JOIN users u ON u.id = r.user_id
       LEFT JOIN payment_methods pm ON pm.id = r.payment_method_id
-      WHERE r.status = $1
+      LEFT JOIN admin_users a ON a.id = r.reviewed_by
+      WHERE r.status::text = $1
       ORDER BY r.created_at ASC
       LIMIT $2 OFFSET $3
     `, [status, limit, offset]);
 
     const { rows: [{ count }] } = await query(
-      'SELECT COUNT(*) FROM recharge_requests WHERE status = $1', [status]
+      'SELECT COUNT(*) FROM recharge_requests WHERE status::text = $1', [status]
     );
 
     res.json({ success: true, data: rows, total: parseInt(count) });
@@ -373,9 +376,8 @@ router.post('/recharges/:id/approve', adminAuth(['admin', 'moderator', 'concilia
       "SELECT * FROM recharge_requests WHERE id = $1 AND status = 'pending'",
       [req.params.id]
     );
-    if (!recharge) return res.status(404).json({ success: false, message: 'Recarga no encontrada' });
+    if (!recharge) return res.status(404).json({ success: false, message: 'Recarga no encontrada o ya procesada' });
 
-    // Acreditar saldo al wallet del usuario
     await query(
       'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
       [recharge.amount, recharge.user_id]
@@ -391,6 +393,7 @@ router.post('/recharges/:id/approve', adminAuth(['admin', 'moderator', 'concilia
     push.notifyRechargeApproved(recharge.user_id, recharge.amount).catch(() => {});
     res.json({ success: true, message: 'Recarga aprobada' });
   } catch (err) {
+    console.error('recharge approve error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -404,7 +407,7 @@ router.post('/recharges/:id/reject', adminAuth(['admin', 'moderator', 'conciliat
       "SELECT * FROM recharge_requests WHERE id = $1 AND status = 'pending'",
       [req.params.id]
     );
-    if (!recharge) return res.status(404).json({ success: false, message: 'Recarga no encontrada' });
+    if (!recharge) return res.status(404).json({ success: false, message: 'Recarga no encontrada o ya procesada' });
 
     await query(
       `UPDATE recharge_requests
@@ -417,6 +420,7 @@ router.post('/recharges/:id/reject', adminAuth(['admin', 'moderator', 'conciliat
     push.notifyRechargeRejected(recharge.user_id, reason).catch(() => {});
     res.json({ success: true, message: 'Recarga rechazada' });
   } catch (err) {
+    console.error('recharge reject error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
