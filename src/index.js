@@ -62,9 +62,11 @@ app.use('*', (req, res) => res.status(404).json({ success:false, message:`Ruta n
 app.use((err, req, res, next) => res.status(err.status||500).json({ success:false, message:process.env.NODE_ENV==='production'?'Error interno':err.message }));
 
 const PORT = process.env.PORT || 3000;
+const SERVER_URL = process.env.SERVER_URL || 'localhost';
+
 server.listen(PORT, () => {
   console.log(`\n🚀 Hacelo API en puerto ${PORT}`);
-  console.log(`🔗 Health: http://localhost:${PORT}/health\n`);
+  console.log(`🔗 Health: http://${SERVER_URL}:${PORT}/health\n`);
   initJobs();
 });
 
