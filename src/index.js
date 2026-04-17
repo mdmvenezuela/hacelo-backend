@@ -28,7 +28,7 @@ const server = http.createServer(app);
 
 initSocket(server);
 
-// ── CORS va PRIMERO — antes de helmet y todo lo demás ─────────
+// ── CORS — va absolutamente primero ──────────────────────────
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(o => o.trim())
@@ -45,15 +45,36 @@ const corsOptions = {
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Length', 'X-Request-Id'],
   optionsSuccessStatus: 204,
 };
 
-// Preflight para TODAS las rutas — debe ser lo primero
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
-// ── El resto de middlewares van después del CORS ──────────────
-app.use(helmet());
+// ── Forzar headers CORS manualmente en cada respuesta ─────────
+// Necesario porque Railway CDN (Fastly) puede strippear headers
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (allowedOrigins.includes(origin) || allowedOrigins.length === 0)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Vary', 'Origin');
+  // Evitar que Railway CDN cachee respuestas de la API
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Surrogate-Control', 'no-store');
+  next();
+});
+
+// ── Resto de middlewares ──────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: false, // No bloquear recursos cross-origin
+}));
 app.use(compression());
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
