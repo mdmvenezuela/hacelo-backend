@@ -503,7 +503,7 @@ router.get('/withdrawals', adminAuth(['admin', 'moderator', 'conciliator']), asy
 router.post('/withdrawals/:id/approve', adminAuth(['admin', 'moderator', 'conciliator']), async (req, res) => {
   try {
     const { rows: [wr] } = await query(
-      "SELECT * FROM withdrawal_requests WHERE id = $1 AND status = 'pending'",
+      "SELECT * FROM withdrawal_requests WHERE id = $1 AND status IN ('pending','processing')",
       [req.params.id]
     );
     if (!wr) return res.status(404).json({ success: false, message: 'Retiro no encontrado o ya procesado' });
@@ -514,50 +514,51 @@ router.post('/withdrawals/:id/approve', adminAuth(['admin', 'moderator', 'concil
         [wr.user_id]
       );
 
-      const balanceBefore = parseFloat(wallet.balance);
-      const amount        = parseFloat(wr.amount);
+      const amount      = parseFloat(wr.amount);
+      const blockedNow  = parseFloat(wallet.blocked_balance);
 
-      if (balanceBefore < amount)
-        throw new Error(`Saldo insuficiente. Disponible: $${balanceBefore.toFixed(2)}`);
+      if (blockedNow < amount)
+        throw new Error(`Saldo en escrow insuficiente. Bloqueado: $${blockedNow.toFixed(2)}`);
 
-      const balanceAfter = balanceBefore - amount;
+      // El balance ya fue descontado al solicitar —
+      // solo quitar del blocked_balance y sumar a total_withdrawn
+      const blockedAfter = blockedNow - amount;
 
-      // Descontar saldo
       await client.query(
-        'UPDATE wallets SET balance = $1, total_withdrawn = total_withdrawn + $2 WHERE user_id = $3',
-        [balanceAfter, amount, wr.user_id]
+        'UPDATE wallets SET blocked_balance = $1, total_withdrawn = total_withdrawn + $2 WHERE user_id = $3',
+        [blockedAfter, amount, wr.user_id]
       );
 
-      // Registrar transacción
+      // Registrar transacción aprobada
       await client.query(`
         INSERT INTO wallet_transactions
           (wallet_id, type, status, amount, balance_before, balance_after,
            reference_id, reference_type, description, metadata)
-        VALUES ($1, 'withdrawal', 'approved', $2, $3, $4, $5, 'withdrawal_request', $6, $7)
+        VALUES ($1, 'withdrawal', 'approved', $2, $3, $3, $4, 'withdrawal_request', $5, $6)
       `, [
-        wallet.id, amount, balanceBefore, balanceAfter, wr.id,
-        `Retiro procesado por: ${req.admin.full_name}`,
+        wallet.id, amount,
+        parseFloat(wallet.balance), // balance no cambia, ya bajó al solicitar
+        wr.id,
+        `Retiro aprobado por: ${req.admin.full_name}`,
         JSON.stringify({ admin_id: req.admin.id, admin_name: req.admin.full_name }),
       ]);
 
-      // Marcar como completado
       await client.query(
         `UPDATE withdrawal_requests
          SET status = 'completed', processed_at = NOW(), processed_by = $1,
              admin_notes = $2
          WHERE id = $3`,
-        [req.admin.id, `Procesado por: ${req.admin.full_name}`, wr.id]
+        [req.admin.id, `Aprobado por: ${req.admin.full_name}`, wr.id]
       );
     });
 
-    // Notificar al proveedor
     push.sendPushToUser(wr.user_id, {
-      title: '💵 Retiro procesado',
+      title: '💵 Retiro completado',
       body:  `Tu retiro de $${parseFloat(wr.amount).toFixed(2)} fue procesado exitosamente.`,
       data:  { screen: 'wallet' },
     }).catch(() => {});
 
-    res.json({ success: true, message: 'Retiro aprobado y saldo descontado' });
+    res.json({ success: true, message: 'Retiro aprobado' });
   } catch (err) {
     console.error('withdrawal approve error:', err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -570,27 +571,58 @@ router.post('/withdrawals/:id/reject', adminAuth(['admin', 'moderator', 'concili
     if (!reason) return res.status(400).json({ success: false, message: 'Motivo requerido' });
 
     const { rows: [wr] } = await query(
-      "SELECT * FROM withdrawal_requests WHERE id = $1 AND status = 'pending'",
+      "SELECT * FROM withdrawal_requests WHERE id = $1 AND status IN ('pending','processing')",
       [req.params.id]
     );
     if (!wr) return res.status(404).json({ success: false, message: 'Retiro no encontrado o ya procesado' });
 
-    await query(
-      `UPDATE withdrawal_requests
-       SET status = 'rejected', processed_at = NOW(),
-           processed_by = $1, admin_notes = $2
-       WHERE id = $3`,
-      [req.admin.id, reason, wr.id]
-    );
+    await transaction(async (client) => {
+      const { rows: [wallet] } = await client.query(
+        'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [wr.user_id]
+      );
+
+      const amount        = parseFloat(wr.amount);
+      const balanceBefore = parseFloat(wallet.balance);
+      const balanceAfter  = balanceBefore + amount; // devolver al balance
+      const blockedAfter  = Math.max(0, parseFloat(wallet.blocked_balance) - amount);
+
+      // Devolver fondos del escrow al balance
+      await client.query(
+        'UPDATE wallets SET balance = $1, blocked_balance = $2 WHERE user_id = $3',
+        [balanceAfter, blockedAfter, wr.user_id]
+      );
+
+      // Registrar devolución
+      await client.query(`
+        INSERT INTO wallet_transactions
+          (wallet_id, type, status, amount, balance_before, balance_after,
+           reference_id, reference_type, description, metadata)
+        VALUES ($1, 'withdrawal', 'rejected', $2, $3, $4, $5, 'withdrawal_request', $6, $7)
+      `, [
+        wallet.id, amount, balanceBefore, balanceAfter, wr.id,
+        `Retiro rechazado — saldo devuelto. Motivo: ${reason}`,
+        JSON.stringify({ admin_id: req.admin.id, admin_name: req.admin.full_name, reason }),
+      ]);
+
+      await client.query(
+        `UPDATE withdrawal_requests
+         SET status = 'rejected', processed_at = NOW(),
+             processed_by = $1, admin_notes = $2
+         WHERE id = $3`,
+        [req.admin.id, reason, wr.id]
+      );
+    });
 
     push.sendPushToUser(wr.user_id, {
       title: '❌ Retiro rechazado',
-      body:  reason,
+      body:  `Tu retiro fue rechazado y el saldo fue devuelto. Motivo: ${reason}`,
       data:  { screen: 'wallet' },
     }).catch(() => {});
 
-    res.json({ success: true, message: 'Retiro rechazado' });
+    res.json({ success: true, message: 'Retiro rechazado y saldo devuelto al proveedor' });
   } catch (err) {
+    console.error('withdrawal reject error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -612,16 +644,24 @@ router.get('/payment-methods', adminAuth(['admin', 'moderator']), async (req, re
 
 router.post('/payment-methods', adminAuth(['admin']), async (req, res) => {
   try {
-    const { name, type, currency = 'USD', instructions, fields = [], minAmount = 1, maxAmount = 1000, verificationTime = '1-4 horas', sortOrder = 0 } = req.body;
+    const {
+      name, type, currency = 'USD', instructions,
+      fields = [], minAmount = 1, maxAmount = 1000,
+      verificationTime = '1-4 horas', sortOrder = 0,
+    } = req.body;
     if (!name || !type)
       return res.status(400).json({ success: false, message: 'name y type son requeridos' });
 
     const { rows: [pm] } = await query(`
       INSERT INTO payment_methods
         (name, type, currency, instructions, fields, min_amount, max_amount, verification_time, sort_order)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
       RETURNING *
-    `, [name, type, currency, instructions || null, JSON.stringify(fields), minAmount, maxAmount, verificationTime, sortOrder]);
+    `, [
+      name, type, currency, instructions || null,
+      JSON.stringify(Array.isArray(fields) ? fields : []),
+      minAmount, maxAmount, verificationTime, sortOrder,
+    ]);
 
     res.status(201).json({ success: true, data: pm });
   } catch (err) {
@@ -631,7 +671,11 @@ router.post('/payment-methods', adminAuth(['admin']), async (req, res) => {
 
 router.patch('/payment-methods/:id', adminAuth(['admin']), async (req, res) => {
   try {
-    const { name, instructions, minAmount, maxAmount, verificationTime, isActive, sortOrder } = req.body;
+    const { name, instructions, minAmount, maxAmount, verificationTime, isActive, sortOrder, fields } = req.body;
+
+    // fields puede ser array o null — si viene lo serializamos como JSONB
+    const fieldsJson = fields !== undefined ? JSON.stringify(fields) : null;
+
     await query(`
       UPDATE payment_methods SET
         name              = COALESCE($1, name),
@@ -641,10 +685,20 @@ router.patch('/payment-methods/:id', adminAuth(['admin']), async (req, res) => {
         verification_time = COALESCE($5, verification_time),
         is_active         = COALESCE($6, is_active),
         sort_order        = COALESCE($7, sort_order),
+        fields            = COALESCE($8::jsonb, fields),
         updated_at        = NOW()
-      WHERE id = $8
-    `, [name ?? null, instructions ?? null, minAmount ?? null, maxAmount ?? null,
-        verificationTime ?? null, isActive ?? null, sortOrder ?? null, req.params.id]);
+      WHERE id = $9
+    `, [
+      name ?? null,
+      instructions ?? null,
+      minAmount ?? null,
+      maxAmount ?? null,
+      verificationTime ?? null,
+      isActive ?? null,
+      sortOrder ?? null,
+      fieldsJson,
+      req.params.id,
+    ]);
 
     res.json({ success: true });
   } catch (err) {
