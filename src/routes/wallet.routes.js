@@ -160,9 +160,12 @@ walletRouter.post('/withdraw', authenticate, async (req, res) => {
       // Actualizar reference_id en la transacción que acabamos de insertar
       await client.query(`
         UPDATE wallet_transactions SET reference_id = $1
-        WHERE wallet_id = $2 AND type = 'withdrawal' AND status = 'pending'
-          AND reference_id IS NULL
-        ORDER BY created_at DESC LIMIT 1
+        WHERE id = (
+          SELECT id FROM wallet_transactions
+          WHERE wallet_id = $2 AND type = 'withdrawal' AND status = 'pending'
+            AND reference_id IS NULL
+          ORDER BY created_at DESC LIMIT 1
+        )
       `, [wr.id, wallet.id]);
 
       return wr;
