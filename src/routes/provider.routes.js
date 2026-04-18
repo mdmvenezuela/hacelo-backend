@@ -154,27 +154,46 @@ router.patch('/me/availability', authenticate, requireProvider, async (req, res)
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
-// ── POST /providers/me/services ───────────────────────────────
+// ── POST /providers/me/services — Reemplaza TODOS los servicios del proveedor
+// Recibe: { services: [{ categoryId, title, description, skills }] }
 router.post('/me/services', authenticate, requireProvider, async (req, res) => {
   try {
-    const { categoryId, title, description, skills } = req.body;
-    if (!categoryId || !title)
-      return res.status(400).json({ success: false, message: 'Categoría y título son requeridos' });
+    console.log('📦 body recibido:', JSON.stringify(req.body));
+    const { services } = req.body;
+
+    if (!Array.isArray(services) || services.length === 0)
+      return res.status(400).json({ success: false, message: 'Envía al menos un servicio' });
+
+    for (const svc of services) {
+      // Aceptar tanto categoryId (camelCase desde app) como category_id (snake_case)
+      const catId = svc.categoryId || svc.category_id;
+      if (!catId || !svc.title?.trim())
+        return res.status(400).json({
+          success: false,
+          message: `Servicio "${svc.title || ''}" — categoryId: ${catId || 'vacío'}, title: "${svc.title || 'vacío'}"`,
+        });
+    }
 
     const { rows: [pp] } = await query(
       'SELECT id FROM provider_profiles WHERE user_id = $1', [req.user.id]
     );
     if (!pp) return res.status(404).json({ success: false, message: 'Perfil no encontrado' });
 
-    const { rows: [service] } = await query(`
-      INSERT INTO provider_services (provider_id, category_id, title, description, skills)
-      VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (provider_id, category_id)
-      DO UPDATE SET title = EXCLUDED.title, description = EXCLUDED.description, skills = EXCLUDED.skills
-      RETURNING *
-    `, [pp.id, categoryId, title, description || null, skills || []]);
+    // Eliminar todos los servicios actuales y reinsertar
+    // (más simple y confiable que intentar hacer diff)
+    await query('DELETE FROM provider_services WHERE provider_id = $1', [pp.id]);
 
-    res.json({ success: true, data: service });
+    const inserted = [];
+    for (const svc of services) {
+      const catId = svc.categoryId || svc.category_id;
+      const { rows: [row] } = await query(`
+        INSERT INTO provider_services (provider_id, category_id, title, description, skills)
+        VALUES ($1, $2, $3, $4, $5) RETURNING *
+      `, [pp.id, catId, svc.title.trim(), svc.description?.trim() || null, svc.skills || []]);
+      inserted.push(row);
+    }
+
+    res.json({ success: true, data: inserted });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
