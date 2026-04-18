@@ -202,8 +202,9 @@ router.post('/:id/items', authenticate, requireProvider, async (req, res) => {
       for (const item of items) {
         const total = parseFloat(item.unitPrice) * parseFloat(item.quantity||1);
         workTotal  += total;
-        await client.query('INSERT INTO order_items (order_id,name,description,quantity,unit_price,total) VALUES ($1,$2,$3,$4,$5,$6)',
-          [order.id, item.name, item.description||null, item.quantity||1, item.unitPrice, total]);
+        // total es columna GENERATED (quantity * unit_price) — no se inserta manualmente
+        await client.query('INSERT INTO order_items (order_id,name,description,quantity,unit_price) VALUES ($1,$2,$3,$4,$5)',
+          [order.id, item.name, item.description||null, item.quantity||1, item.unitPrice]);
       }
       await client.query("UPDATE orders SET status='quote_sent', work_total=$1, quote_sent_at=NOW() WHERE id=$2", [workTotal.toFixed(2), order.id]);
     });
@@ -277,6 +278,6 @@ router.patch('/:id/confirm', authenticate, async (req, res) => {
     push.notifyPaymentReleased(order.provider_id, { id: order.id, netEarned: net.toFixed(2) }).catch(() => {});
     res.json({ success:true });
   } catch (err) { res.status(500).json({ success:false, message:err.message }); }
-}); 
+});
 
 module.exports = router;
