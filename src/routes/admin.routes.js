@@ -115,9 +115,10 @@ router.get('/dashboard', adminAuth(['admin', 'moderator']), async (req, res) => 
       `),
       query(`
         SELECT
-          COUNT(*) FILTER (WHERE status = 'pending')    AS pending,
-          COUNT(*) FILTER (WHERE status = 'processing') AS processing,
-          SUM(amount) FILTER (WHERE status = 'pending') AS pending_amount
+          COUNT(*) FILTER (WHERE status = 'pending')           AS pending,
+          COUNT(*) FILTER (WHERE status = 'completed')         AS completed,
+          SUM(amount) FILTER (WHERE status = 'pending')        AS pending_amount,
+          SUM(amount) FILTER (WHERE status = 'completed')      AS completed_amount
         FROM withdrawal_requests
       `),
     ]);
@@ -829,6 +830,105 @@ router.patch('/admins/:id', adminAuth(['admin']), async (req, res) => {
     );
     res.json({ success: true });
   } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// FINANZAS — resumen financiero con filtros por fecha
+// ════════════════════════════════════════════════════════════════
+
+router.get('/finance', adminAuth(['admin', 'moderator']), async (req, res) => {
+  try {
+    const { from, to } = req.query;
+
+    const buildDateFilter = (col, startIdx) => {
+      if (from && to)  return `AND ${col} BETWEEN $${startIdx} AND $${startIdx+1}`;
+      if (from || to)  return `AND ${col} >= $${startIdx}`;
+      return '';
+    };
+    const dateParams = from && to ? [from, to] : (from || to) ? [from || to] : [];
+    const dp = dateParams;
+
+    const [recharges, withdrawals, commissions, wallets, byRole, txSummary, topProviders] = await Promise.all([
+      query(`SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS total
+             FROM recharge_requests WHERE status='approved' ${buildDateFilter('reviewed_at', 1)}`, dp),
+
+      query(`SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS total
+             FROM withdrawal_requests WHERE status='completed' ${buildDateFilter('processed_at', 1)}`, dp),
+
+      query(`SELECT COUNT(*) AS orders_count,
+               COALESCE(SUM(commission_amount),0) AS total_commission,
+               COALESCE(SUM(visit_price),0)       AS total_visit_revenue,
+               COALESCE(SUM(work_total),0)        AS total_work_volume
+             FROM orders WHERE status IN ('confirmed','completed') AND commission_amount > 0
+             ${buildDateFilter('confirmed_at', 1)}`, dp),
+
+      query(`SELECT COALESCE(SUM(balance),0)         AS total_client_balance,
+               COALESCE(SUM(blocked_balance),0)  AS total_blocked,
+               COALESCE(SUM(total_earned),0)      AS total_earned_providers,
+               COALESCE(SUM(total_withdrawn),0)   AS total_withdrawn_providers
+             FROM wallets`, []),
+
+      query(`SELECT u.role, COALESCE(SUM(w.balance),0) AS balance,
+               COALESCE(SUM(w.blocked_balance),0) AS blocked, COUNT(*) AS count
+             FROM wallets w JOIN users u ON u.id=w.user_id GROUP BY u.role`, []),
+
+      query(`SELECT type, status, COUNT(*) AS count, COALESCE(SUM(amount),0) AS total
+             FROM wallet_transactions wt JOIN wallets w ON w.id=wt.wallet_id
+             WHERE 1=1 ${buildDateFilter('wt.created_at', 1)}
+             GROUP BY type,status ORDER BY type,status`, dp),
+
+      query(`SELECT u.full_name, u.email,
+               COALESCE(w.total_earned,0) AS total_earned,
+               COALESCE(w.total_withdrawn,0) AS total_withdrawn,
+               COALESCE(w.balance,0) AS current_balance,
+               pp.orders_completed
+             FROM wallets w JOIN users u ON u.id=w.user_id
+             JOIN provider_profiles pp ON pp.user_id=u.id
+             WHERE u.role='provider' ORDER BY w.total_earned DESC LIMIT 5`, []),
+    ]);
+
+    const r = recharges.rows[0];
+    const w2 = withdrawals.rows[0];
+    const c = commissions.rows[0];
+    const wl = wallets.rows[0];
+
+    res.json({
+      success: true,
+      data: {
+        period: { from: from || null, to: to || null },
+        recharges:   { count: parseInt(r.count),  total: parseFloat(r.total) },
+        withdrawals: { count: parseInt(w2.count), total: parseFloat(w2.total) },
+        commissions: {
+          ordersCount:       parseInt(c.orders_count),
+          totalCommission:   parseFloat(c.total_commission),
+          totalVisitRevenue: parseFloat(c.total_visit_revenue),
+          totalWorkVolume:   parseFloat(c.total_work_volume),
+        },
+        wallets: {
+          totalClientBalance:      parseFloat(wl.total_client_balance),
+          totalBlocked:            parseFloat(wl.total_blocked),
+          totalEarnedProviders:    parseFloat(wl.total_earned_providers),
+          totalWithdrawnProviders: parseFloat(wl.total_withdrawn_providers),
+        },
+        byRole: byRole.rows.reduce((acc, row) => {
+          acc[row.role] = { balance: parseFloat(row.balance), blocked: parseFloat(row.blocked), count: parseInt(row.count) };
+          return acc;
+        }, {}),
+        txSummary: txSummary.rows,
+        topProviders: topProviders.rows.map(p => ({
+          fullName:        p.full_name,
+          email:           p.email,
+          totalEarned:     parseFloat(p.total_earned),
+          totalWithdrawn:  parseFloat(p.total_withdrawn),
+          currentBalance:  parseFloat(p.current_balance),
+          ordersCompleted: parseInt(p.orders_completed),
+        })),
+      },
+    });
+  } catch (err) {
+    console.error('finance error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
