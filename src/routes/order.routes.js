@@ -224,7 +224,7 @@ router.patch('/:id/accept-quote', authenticate, async (req, res) => {
     await WalletService.blockFunds(req.user.id, order.work_total, {
       orderId:order.id, description:`Pago por trabajo — Orden #${String(order.order_number).padStart(6,'0')}`
     });
-    await query("UPDATE orders SET status='in_progress', work_accepted_at=NOW() WHERE id=$1", [order.id]);
+    await query("UPDATE orders SET status='in_progress', work_started_at=NOW() WHERE id=$1", [order.id]);
     emitToUser(order.provider_id, 'quote_accepted', { orderId:order.id, message:'¡El cliente aceptó el presupuesto! Comienza el trabajo.' });
     // 🔔 Push al proveedor
     push.notifyQuoteAccepted(order.provider_id, { id: order.id, workTotal: parseFloat(order.work_total).toFixed(2) }).catch(() => {});
