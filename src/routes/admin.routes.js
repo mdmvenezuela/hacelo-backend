@@ -713,6 +713,75 @@ router.delete('/payment-methods/:id', adminAuth(['admin']), async (req, res) => 
   }
 });
 
+
+// ════════════════════════════════════════════════════════════════
+// SECTORES — vinculados a zonas
+// ════════════════════════════════════════════════════════════════
+
+router.get('/sectors', adminAuth(['admin', 'moderator']), async (req, res) => {
+  try {
+    const { zoneId } = req.query;
+    const params = [];
+    let where = '';
+    if (zoneId) { params.push(zoneId); where = 'WHERE s.zone_id = $1'; }
+
+    const { rows } = await query(`
+      SELECT s.*, z.name AS zone_name
+      FROM sectors s
+      JOIN zones z ON z.id = s.zone_id
+      ${where}
+      ORDER BY z.name, s.sort_order, s.name
+    `, params);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/sectors', adminAuth(['admin']), async (req, res) => {
+  try {
+    const { zoneId, name, slug, sortOrder = 0 } = req.body;
+    if (!zoneId || !name || !slug)
+      return res.status(400).json({ success: false, message: 'zoneId, name y slug son requeridos' });
+
+    const { rows: [sector] } = await query(`
+      INSERT INTO sectors (zone_id, name, slug, sort_order)
+      VALUES ($1, $2, $3, $4) RETURNING *
+    `, [zoneId, name, slug.toLowerCase().replace(/\s+/g, '-'), sortOrder]);
+
+    res.status(201).json({ success: true, data: sector });
+  } catch (err) {
+    if (err.code === '23505')
+      return res.status(409).json({ success: false, message: 'Ya existe un sector con ese slug en esta zona' });
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.patch('/sectors/:id', adminAuth(['admin']), async (req, res) => {
+  try {
+    const { name, isActive, sortOrder } = req.body;
+    await query(`
+      UPDATE sectors SET
+        name       = COALESCE($1, name),
+        is_active  = COALESCE($2, is_active),
+        sort_order = COALESCE($3, sort_order)
+      WHERE id = $4
+    `, [name ?? null, isActive ?? null, sortOrder ?? null, req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/sectors/:id', adminAuth(['admin']), async (req, res) => {
+  try {
+    await query('UPDATE sectors SET is_active = false WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════
 // ADMINS — solo admin
 // ════════════════════════════════════════════════════════════════

@@ -95,3 +95,36 @@ router.patch('/me', authenticate, async (req, res) => {
 });
 
 module.exports = router;
+
+// ── GET /zones/:zoneId/sectors — Sectores de una zona ────────
+router.get('/:zoneId/sectors', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT * FROM sectors
+       WHERE zone_id = $1 AND is_active = true
+       ORDER BY sort_order, name`,
+      [req.params.zoneId]
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /zones/sectors/all — Todos los sectores del usuario ──
+// Útil para cargar sectores de la zona del usuario logueado
+router.get('/sectors/by-zone/:zoneId', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT s.*, z.name AS zone_name
+       FROM sectors s
+       JOIN zones z ON z.id = s.zone_id
+       WHERE s.zone_id = $1 AND s.is_active = true
+       ORDER BY s.sort_order, s.name`,
+      [req.params.zoneId]
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
