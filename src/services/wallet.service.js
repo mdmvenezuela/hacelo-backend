@@ -32,7 +32,8 @@ class WalletService {
     });
   }
 
-  static async blockFunds(userId, amount, { orderId, description } = {}) {
+  // type permite diferenciar 'visit_block' (reserva de visita) de 'work_block' (reserva de trabajo)
+  static async blockFunds(userId, amount, { orderId, description, type = 'visit_block' } = {}) {
     return transaction(async (client) => {
       const { rows: [wallet] } = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [userId]);
       const available = parseFloat(wallet.balance);
@@ -41,7 +42,17 @@ class WalletService {
       const balanceAfter  = available - parseFloat(amount);
       const blockedAfter  = parseFloat(wallet.blocked_balance) + parseFloat(amount);
       await client.query('UPDATE wallets SET balance = $1, blocked_balance = $2 WHERE user_id = $3', [balanceAfter, blockedAfter, userId]);
-      await this.logTransaction(client, { walletId: wallet.id, type: 'visit_block', status: 'approved', amount, balanceBefore, balanceAfter, referenceId: orderId, referenceType: 'order', description: description || `Bloqueo por orden #${orderId}` });
+      await this.logTransaction(client, {
+        walletId: wallet.id,
+        type,
+        status: 'approved',
+        amount,
+        balanceBefore,
+        balanceAfter,
+        referenceId:   orderId,
+        referenceType: 'order',
+        description:   description || `Bloqueo por orden #${orderId}`,
+      });
       return { balance: balanceAfter, blocked: blockedAfter };
     });
   }
@@ -62,21 +73,18 @@ class WalletService {
 
   static async chargeVisit(clientId, providerId, amount, orderId) {
     return transaction(async (client) => {
-      // Descontar del blocked del cliente
       const { rows: [clientWallet] } = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [clientId]);
       const clientBlockedNew = parseFloat(clientWallet.blocked_balance) - parseFloat(amount);
       if (clientBlockedNew < 0) throw new Error('Saldo bloqueado insuficiente del cliente');
       await client.query('UPDATE wallets SET blocked_balance = $1 WHERE user_id = $2', [clientBlockedNew, clientId]);
       await this.logTransaction(client, { walletId: clientWallet.id, type: 'visit_charge', status: 'approved', amount, balanceBefore: parseFloat(clientWallet.balance), balanceAfter: parseFloat(clientWallet.balance), referenceId: orderId, referenceType: 'order', description: `Cobro de visita - Orden #${orderId}` });
 
-      // Comisión
       const { rows: [pp] } = await client.query(`SELECT pp.level FROM provider_profiles pp WHERE pp.user_id = $1`, [providerId]);
-      const rates = { lila: parseFloat(process.env.COMMISSION_LILA || 0.135), plata: parseFloat(process.env.COMMISSION_PLATA || 0.12), oro: parseFloat(process.env.COMMISSION_ORO || 0.10) };
+      const rates      = { lila: parseFloat(process.env.COMMISSION_LILA || 0.135), plata: parseFloat(process.env.COMMISSION_PLATA || 0.12), oro: parseFloat(process.env.COMMISSION_ORO || 0.10) };
       const rate       = rates[pp?.level || 'lila'];
       const commission = parseFloat((parseFloat(amount) * rate).toFixed(2));
       const netAmount  = parseFloat((parseFloat(amount) - commission).toFixed(2));
 
-      // Acreditar al proveedor
       const { rows: [provWallet] } = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [providerId]);
       const provBalanceAfter = parseFloat(provWallet.balance) + netAmount;
       await client.query('UPDATE wallets SET balance = $1, total_earned = total_earned + $2 WHERE user_id = $3', [provBalanceAfter, netAmount, providerId]);
@@ -90,30 +98,25 @@ class WalletService {
 
   static async releaseWorkPayment(clientId, providerId, amount, orderId) {
     return transaction(async (client) => {
-      // Quitar del blocked del cliente
       const { rows: [clientWallet] } = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [clientId]);
       const newBlocked = parseFloat(clientWallet.blocked_balance) - parseFloat(amount);
       if (newBlocked < 0) throw new Error('Saldo bloqueado insuficiente');
       await client.query('UPDATE wallets SET blocked_balance = $1 WHERE user_id = $2', [newBlocked, clientId]);
       await this.logTransaction(client, { walletId: clientWallet.id, type: 'work_release', status: 'approved', amount, balanceBefore: parseFloat(clientWallet.balance), balanceAfter: parseFloat(clientWallet.balance), referenceId: orderId, referenceType: 'order', description: `Pago liberado al proveedor - Orden #${orderId}` });
 
-      // Comisión
       const { rows: [pp] } = await client.query(`SELECT level FROM provider_profiles WHERE user_id = $1`, [providerId]);
-      const rates = { lila: parseFloat(process.env.COMMISSION_LILA || 0.135), plata: parseFloat(process.env.COMMISSION_PLATA || 0.12), oro: parseFloat(process.env.COMMISSION_ORO || 0.10) };
+      const rates      = { lila: parseFloat(process.env.COMMISSION_LILA || 0.135), plata: parseFloat(process.env.COMMISSION_PLATA || 0.12), oro: parseFloat(process.env.COMMISSION_ORO || 0.10) };
       const rate       = rates[pp?.level || 'lila'];
       const commission = parseFloat((parseFloat(amount) * rate).toFixed(2));
       const netAmount  = parseFloat((parseFloat(amount) - commission).toFixed(2));
 
-      // Acreditar al proveedor
       const { rows: [provWallet] } = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [providerId]);
       const newBalance = parseFloat(provWallet.balance) + netAmount;
       await client.query('UPDATE wallets SET balance = $1, total_earned = total_earned + $2 WHERE user_id = $3', [newBalance, netAmount, providerId]);
       await this.logTransaction(client, { walletId: provWallet.id, type: 'work_release', status: 'approved', amount: netAmount, balanceBefore: parseFloat(provWallet.balance), balanceAfter: newBalance, referenceId: orderId, referenceType: 'order', description: `Pago de trabajo recibido - Orden #${orderId}`, metadata: { grossAmount: amount, commission, rate } });
 
-      // Actualizar orden
       await client.query(`UPDATE orders SET work_paid = true, work_paid_at = NOW(), commission_amount = COALESCE(commission_amount, 0) + $1 WHERE id = $2`, [commission, orderId]);
 
-      // ── FIX: cast explícito a provider_level ─────────────────
       await client.query(`
         UPDATE provider_profiles
         SET points = points + 1,
@@ -127,7 +130,7 @@ class WalletService {
       `, [
         parseInt(process.env.POINTS_PLATA_MAX || 200),
         parseInt(process.env.POINTS_LILA_MAX  || 50),
-        providerId
+        providerId,
       ]);
 
       return { netAmount, commission, rate };

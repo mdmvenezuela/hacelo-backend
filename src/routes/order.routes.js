@@ -222,7 +222,9 @@ router.patch('/:id/accept-quote', authenticate, async (req, res) => {
     const { rows:[order] } = await query("SELECT * FROM orders WHERE id=$1 AND client_id=$2 AND status='quote_sent'", [req.params.id, req.user.id]);
     if (!order) return res.status(404).json({ success:false, message:'Orden no encontrada' });
     await WalletService.blockFunds(req.user.id, order.work_total, {
-      orderId:order.id, description:`Pago por trabajo — Orden #${String(order.order_number).padStart(6,'0')}`
+      orderId:     order.id,
+      type:        'work_block',
+      description: `Reserva por trabajo — Orden #${String(order.order_number).padStart(6,'0')}`,
     });
     await query("UPDATE orders SET status='in_progress', work_started_at=NOW() WHERE id=$1", [order.id]);
     emitToUser(order.provider_id, 'quote_accepted', { orderId:order.id, message:'¡El cliente aceptó el presupuesto! Comienza el trabajo.' });
