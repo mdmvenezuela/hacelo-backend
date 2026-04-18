@@ -765,3 +765,63 @@ router.patch('/admins/:id', adminAuth(['admin']), async (req, res) => {
 });
 
 module.exports = router;
+
+
+// ════════════════════════════════════════════════════════════════
+// ZONAS — solo admin
+// ════════════════════════════════════════════════════════════════
+
+router.get('/zones', adminAuth(['admin', 'moderator']), async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT z.*,
+        COUNT(u.id) FILTER (WHERE u.zone_id = z.id) AS user_count
+      FROM zones z
+      LEFT JOIN users u ON u.zone_id = z.id
+      GROUP BY z.id
+      ORDER BY z.sort_order, z.name
+    `);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/zones', adminAuth(['admin']), async (req, res) => {
+  try {
+    const { name, slug, state = 'Zulia', latCenter, lngCenter, radiusKm = 15, sortOrder = 0 } = req.body;
+    if (!name || !slug || !latCenter || !lngCenter)
+      return res.status(400).json({ success: false, message: 'name, slug, latCenter y lngCenter son requeridos' });
+
+    const { rows: [zone] } = await query(`
+      INSERT INTO zones (name, slug, state, lat_center, lng_center, radius_km, sort_order)
+      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
+    `, [name, slug, state, latCenter, lngCenter, radiusKm, sortOrder]);
+
+    res.status(201).json({ success: true, data: zone });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ success: false, message: 'Ya existe una zona con ese slug' });
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.patch('/zones/:id', adminAuth(['admin']), async (req, res) => {
+  try {
+    const { name, state, latCenter, lngCenter, radiusKm, isActive, sortOrder } = req.body;
+    await query(`
+      UPDATE zones SET
+        name       = COALESCE($1, name),
+        state      = COALESCE($2, state),
+        lat_center = COALESCE($3, lat_center),
+        lng_center = COALESCE($4, lng_center),
+        radius_km  = COALESCE($5, radius_km),
+        is_active  = COALESCE($6, is_active),
+        sort_order = COALESCE($7, sort_order)
+      WHERE id = $8
+    `, [name??null, state??null, latCenter??null, lngCenter??null,
+        radiusKm??null, isActive??null, sortOrder??null, req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
