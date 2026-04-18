@@ -22,14 +22,13 @@ const generateTokens = (userId, role) => {
 };
 
 // ── Construir objeto de usuario completo ──────────────────────
+// IMPORTANTE: siempre incluye is_verified desde users Y desde provider_profiles
 const buildUserObject = async (userId) => {
   const { rows: [user] } = await query(`
     SELECT
       u.id, u.email, u.full_name, u.phone, u.role,
-      u.avatar_url, u.created_at, u.zone_id,
+      u.avatar_url, u.created_at,
       COALESCE(u.is_verified, false)  AS is_verified,
-      z.name  AS zone_name,
-      z.state AS zone_state,
       pp.kyc_status,
       pp.visit_price,
       pp.rating_avg,
@@ -40,13 +39,13 @@ const buildUserObject = async (userId) => {
       pp.city,
       COALESCE(pp.is_verified, false) AS provider_is_verified
     FROM users u
-    LEFT JOIN zones z ON z.id = u.zone_id
     LEFT JOIN provider_profiles pp ON pp.user_id = u.id
     WHERE u.id = $1
   `, [userId]);
 
   if (!user) return null;
 
+  // is_verified = true si ANY de las dos columnas es true
   user.is_verified = user.is_verified === true || user.provider_is_verified === true;
   delete user.provider_is_verified;
 
@@ -56,37 +55,22 @@ const buildUserObject = async (userId) => {
 // ── POST /auth/register ───────────────────────────────────────
 router.post('/register', async (req, res) => {
   try {
-    const { email, password, fullName, phone, role = 'client', zoneId } = req.body;
+    const { email, password, fullName, phone, role = 'client' } = req.body;
 
     if (!email || !password || !fullName) {
       return res.status(400).json({ success: false, message: 'Email, contraseña y nombre son requeridos' });
     }
 
-    const { rows: [existing] } = await query(
-      'SELECT id FROM users WHERE email = $1', [email.toLowerCase()]
-    );
+    const { rows: [existing] } = await query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
     if (existing) return res.status(409).json({ success: false, message: 'Ya existe una cuenta con ese email' });
-
-    // Resolver zone_id: usar el enviado, o asignar la primera zona activa por defecto
-    let resolvedZoneId = zoneId || null;
-    if (!resolvedZoneId) {
-      const { rows: [defaultZone] } = await query(
-        'SELECT id FROM zones WHERE is_active = true ORDER BY sort_order LIMIT 1'
-      );
-      resolvedZoneId = defaultZone?.id || null;
-    }
 
     const hash = await bcrypt.hash(password, 12);
     const { rows: [user] } = await query(`
-      INSERT INTO users (email, password_hash, full_name, phone, role, is_verified, zone_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      INSERT INTO users (email, password_hash, full_name, phone, role, is_verified)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING id, role
-    `, [
-      email.toLowerCase(), hash, fullName,
-      phone || null, role,
-      role === 'client', // clientes se verifican automáticamente
-      resolvedZoneId,
-    ]);
+    `, [email.toLowerCase(), hash, fullName, phone || null, role, role === 'client']);
+    // Clientes se verifican automáticamente, proveedores necesitan KYC
 
     if (role === 'provider') {
       await query(`
@@ -94,13 +78,18 @@ router.post('/register', async (req, res) => {
         VALUES ($1, false, 'pending')
         ON CONFLICT (user_id) DO NOTHING
       `, [user.id]);
+      await query(`
+        INSERT INTO wallets (user_id, balance, blocked_balance)
+        VALUES ($1, 0, 0)
+        ON CONFLICT (user_id) DO NOTHING
+      `, [user.id]);
+    } else {
+      await query(`
+        INSERT INTO wallets (user_id, balance, blocked_balance)
+        VALUES ($1, 0, 0)
+        ON CONFLICT (user_id) DO NOTHING
+      `, [user.id]);
     }
-
-    await query(`
-      INSERT INTO wallets (user_id, balance, blocked_balance)
-      VALUES ($1, 0, 0)
-      ON CONFLICT (user_id) DO NOTHING
-    `, [user.id]);
 
     const fullUser = await buildUserObject(user.id);
     const tokens   = generateTokens(user.id, role);
@@ -130,11 +119,14 @@ router.post('/login', async (req, res) => {
     const valid = await bcrypt.compare(password, row.password_hash);
     if (!valid) return res.status(401).json({ success: false, message: 'Email o contraseña incorrectos' });
 
+    // Construir objeto completo con is_verified correcto
     const user   = await buildUserObject(row.id);
     const tokens = generateTokens(row.id, row.role);
 
+    // Obtener wallet del usuario
     const { rows: [wallet] } = await query(
-      'SELECT balance, blocked_balance FROM wallets WHERE user_id = $1', [row.id]
+      'SELECT balance, blocked_balance FROM wallets WHERE user_id = $1',
+      [row.id]
     );
 
     res.json({
@@ -151,14 +143,15 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// ── GET /auth/me ──────────────────────────────────────────────
+// ── GET /auth/me — Obtener usuario actual ─────────────────────
 router.get('/me', authenticate, async (req, res) => {
   try {
     const user = await buildUserObject(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
 
     const { rows: [wallet] } = await query(
-      'SELECT balance, blocked_balance FROM wallets WHERE user_id = $1', [req.user.id]
+      'SELECT balance, blocked_balance FROM wallets WHERE user_id = $1',
+      [req.user.id]
     );
 
     res.json({
@@ -183,6 +176,7 @@ router.post('/refresh', async (req, res) => {
       refreshToken,
       process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET
     );
+
     const tokens = generateTokens(decoded.userId, decoded.role);
     res.json({ success: true, data: { tokens } });
   } catch {
