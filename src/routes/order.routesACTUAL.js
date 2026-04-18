@@ -66,7 +66,7 @@ router.get('/:id', authenticate, async (req, res) => {
 // ── POST /orders ──────────────────────────────────────────────
 router.post('/', authenticate, async (req, res) => {
   try {
-    const { providerId, categoryId, title, description, address, city='Cabimas', isUrgent=false, photos=[], latitude=null, longitude=null } = req.body;
+    const { providerId, categoryId, title, description, address, city='Cabimas', isUrgent=false, photos=[] } = req.body;
     if (!providerId || !title || !address)
       return res.status(400).json({ success: false, message: 'providerId, title y address son requeridos' });
     const { rows: [pp] } = await query('SELECT id, visit_price, is_available FROM provider_profiles WHERE user_id=$1', [providerId]);
@@ -76,13 +76,10 @@ router.post('/', authenticate, async (req, res) => {
     await WalletService.blockFunds(req.user.id, visitPrice, { description: `Reserva de visita — ${title}` });
     const expiresAt  = new Date(Date.now() + 30*60*1000).toISOString();
     const photosJson = JSON.stringify(Array.isArray(photos) ? photos : []);
-    const lat = latitude  ? parseFloat(latitude)  : null;
-    const lng = longitude ? parseFloat(longitude) : null;
-
     const { rows: [order] } = await query(`
-      INSERT INTO orders (client_id,provider_id,category_id,title,description,address,city,is_urgent,visit_price,status,expires_at,photos,latitude,longitude)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'requested',$10,$11::jsonb,$12,$13) RETURNING *
-    `, [req.user.id, providerId, categoryId||null, title, description||null, address, city, isUrgent, visitPrice, expiresAt, photosJson, lat, lng]);
+      INSERT INTO orders (client_id,provider_id,category_id,title,description,address,city,is_urgent,visit_price,status,expires_at,photos)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'requested',$10,$11::jsonb) RETURNING *
+    `, [req.user.id, providerId, categoryId||null, title, description||null, address, city, isUrgent, visitPrice, expiresAt, photosJson]);
     emitToUser(providerId, 'new_order', { orderId:order.id, orderNumber:`#${String(order.order_number).padStart(6,'0')}`, message:`Nueva solicitud: ${title}`, isUrgent });
     // 🔔 Push al proveedor
     push.notifyNewOrder(providerId, { id: order.id, clientName: req.user.full_name, categoryName: title }).catch(() => {});
@@ -277,6 +274,6 @@ router.patch('/:id/confirm', authenticate, async (req, res) => {
     push.notifyPaymentReleased(order.provider_id, { id: order.id, netEarned: net.toFixed(2) }).catch(() => {});
     res.json({ success:true });
   } catch (err) { res.status(500).json({ success:false, message:err.message }); }
-}); 
+});
 
 module.exports = router;
