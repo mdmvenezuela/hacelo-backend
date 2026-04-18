@@ -22,6 +22,7 @@ const notificationRoutes = require('./routes/notification.routes');
 const adminRoutes        = require('./routes/admin.routes');
 const kycRoutes          = require('./routes/kyc.routes');
 const uploadRoutes       = require('./routes/upload.routes');
+const zonesRoutes        = require('./routes/zones.routes');
 
 const app    = express();
 const server = http.createServer(app);
@@ -51,6 +52,7 @@ const corsOptions = {
 
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
+
 
 // ── Forzar headers CORS manualmente en cada respuesta ─────────
 // Necesario porque Railway CDN (Fastly) puede strippear headers
@@ -98,6 +100,7 @@ app.use(`${API}/notifications`, notificationRoutes);
 app.use(`${API}/admin`,         adminRoutes);
 app.use(`${API}/kyc`,           kycRoutes);
 app.use(`${API}/upload`,        uploadRoutes);
+app.use(`${API}/zones`, zonesRoutes);
 
 app.use('*', (req, res) => res.status(404).json({
   success: false,
